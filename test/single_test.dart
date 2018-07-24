@@ -2,8 +2,11 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:logging/logging.dart';
+import 'package:mockito/mockito.dart';
 import 'package:options_file/options_file.dart';
 import 'package:sqljocky5/sqljocky.dart';
+import 'package:sqljocky5/src/buffered_socket.dart';
+import 'package:sqljocky5/src/handlers/handler.dart';
 import 'package:sqljocky5/src/single_connection.dart';
 import 'package:sqljocky5/utils.dart';
 import 'package:test/test.dart';
@@ -57,5 +60,45 @@ void main() {
     }
   });
 
+  test('timeout connect test', () async {
+    // The connect call should raise a timeout.
+    var sock;
+    bool thrown = false;
+    try {
+      sock = await ServerSocket.bind("localhost", 12346);
+      await SingleConnection.connect(
+          host: 'localhost',
+          port: 12346,
+          timeout: new Duration(microseconds: 5));
+    } on TimeoutException catch (e) {
+      thrown = true;
+    } finally {
+      sock?.close();
+    }
+    expect(thrown, true);
+  });
 
+  test('calling close on a broken socket should respect the socket timeout. close never throws.', () async {
+    _MockReqResp m = new _MockReqResp();
+    when(m.processHandlerNoResponse(any)).thenReturn(new Completer().future);
+
+    SingleConnection conn = new SingleConnection(const Duration(microseconds: 5), m);
+    await conn.close();  // does not timeout the test.
+  });
+
+  test('calling query on a broken socket should respect the socket timeout', () async {
+    _MockReqResp m = new _MockReqResp();
+    when(m.processHandler(any)).thenReturn(new Completer().future);
+
+    SingleConnection conn = new SingleConnection(const Duration(microseconds: 5), m);
+    expect(conn.query("SELECT 1"), throwsA(timeoutMatcher));
+  });
+}
+
+class _MockReqResp extends Mock implements ReqRespConnection {}
+
+final Matcher timeoutMatcher = const _TimeoutException();
+class _TimeoutException extends TypeMatcher {
+  const _TimeoutException() : super("TimeoutException");
+  bool matches(item, Map matchState) => item is TimeoutException;
 }

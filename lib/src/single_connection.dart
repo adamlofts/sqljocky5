@@ -22,18 +22,181 @@ import 'results/field.dart';
 import 'results/results.dart';
 import 'results/row.dart';
 
-final _log = new Logger("SingleConnection");
+final Logger _log = new Logger("SingleConnection");
 
 /// Represents a connection to the database. Use [connect] to open a connection. You
 /// must call [close] when you are done.
 class SingleConnection {
+  final Duration _timeout;
+
+  ReqRespConnection _conn;
+  bool _sentClose = false;
+
+  SingleConnection(this._timeout, this._conn);
+
+  /// Close the connection
+  ///
+  /// This method will never throw
+  Future close() async {
+    if (_sentClose) {
+      return;
+    }
+    _sentClose = true;
+
+    try {
+      await _conn.processHandlerNoResponse(new QuitHandler())
+        .timeout(_timeout);
+    } catch (e) {
+      _log.info("Error sending quit on connection");
+    }
+
+    _conn.close();
+  }
+
+  static Future<SingleConnection> _connect(
+      Duration timeout,
+      {String host,
+      int port,
+      String user,
+      String password,
+      String db,
+      bool useCompression: false,
+      bool useSSL: false,
+      int maxPacketSize: 16 * 1024 * 1024,
+      }) {
+
+    assert(!useSSL);  // Not implemented
+    assert(!useCompression);
+
+    var handshakeCompleter = new Completer();
+    ReqRespConnection conn;
+    SingleConnection sc;
+
+    _log.fine("opening connection to $host:$port/$db");
+    BufferedSocket.connect(host, port,
+        onConnection: (socket) {
+          conn = new ReqRespConnection(socket, maxPacketSize, user, password, db, useCompression, useSSL, handshakeCompleter);
+        },
+        onDataReady: () {
+          conn?._readPacket();
+        },
+        onDone: () {
+          conn?.close();
+          _log.fine("done");
+        },
+        onError: (error) {
+          _log.severe("socket error: $error");
+          // If the error happens during connect then propagate in the future.
+          // otherwise send to the socket.
+          if (!handshakeCompleter.isCompleted) {
+            handshakeCompleter.completeError(error);
+            return;
+          } else {
+            conn?.close();
+          }
+        },
+        onClosed: () {
+          conn?.close();
+        });
+
+    //TODO Only useDatabase if connection actually ended up as an SSL connection?
+    //TODO On the other hand, it doesn't hurt to call useDatabase anyway.
+//    if (useSSL) {
+//      await _completer.future;
+//      return _useDatabase(db);
+//    } else {
+    return handshakeCompleter.future.then((_) {
+      sc = new SingleConnection(timeout, conn);
+      return sc;
+    });
+//    }
+  }
+
+  /// Connects a MySQL server at the given [host] on [port], authenticates using [user]
+  /// and [password] and connects to [db].
+  ///
+  /// [timeout] is used as the connection timeout and the default timeout for all socket
+  /// communication.
+  static Future<SingleConnection> connect(
+      {String host,
+        int port,
+        String user,
+        String password,
+        String db,
+        bool useCompression: false,
+        bool useSSL: false,
+        int maxPacketSize: 16 * 1024 * 1024,
+        Duration timeout: const Duration(seconds: 30)
+      }) {
+    // In dart2 this can be replaced with a timeout parameter to connect
+    return
+      _connect(timeout, host: host, port: port, user: user, password: password, db: db, useCompression: useCompression, useSSL: useSSL, maxPacketSize: maxPacketSize)
+      .timeout(timeout);
+  }
+
+  Future<ReadResults> query(String sql, [List values]) async {
+    if (values == null || values.isEmpty) {
+      // Run the query without preparing it since we have no arguments.
+      var results = await _conn.processHandler(new QueryStreamHandler(sql))
+        .timeout(_timeout);
+      _log.fine("Got query results on for: ${sql}");
+      return await ReadResults.read(results);
+    }
+
+    var prepared;
+    var results;
+    try {
+      prepared = await _conn.processHandler(new PrepareHandler(sql))
+        .timeout(_timeout);
+      _log.fine("Prepared new query for: $sql");
+
+      var handler = new ExecuteQueryHandler(prepared, false /* executed */, values);
+      results = await _conn.processHandler(handler)
+          .timeout(_timeout);
+
+      _log.finest("Prepared query got results");
+
+      // Read all of the results. This is so we can close the handler before returning to the
+      // user. Obviously this is not super efficient but it guarantees correct api use.
+      return await ReadResults.read(results);
+
+    } finally {
+      if (prepared != null) {
+        await _conn.processHandlerNoResponse(new CloseStatementHandler(prepared.statementHandlerId))
+            .timeout(_timeout);
+      }
+    }
+  }
+}
+
+class ReadResults extends IterableBase<Row> {
+  final int insertId;
+  final int affectedRows;
+  final List<Field> fields;
+  final List<Row> _rows;
+
+  ReadResults(this._rows, this.fields, this.insertId, this.affectedRows);
+
+  static Future<ReadResults> read(Results r) async {
+    var rows = await r.toList();
+    return new ReadResults(rows, r.fields, r.insertId, r.affectedRows);
+  }
+
+  @override
+  Iterator<Row> get iterator {
+    return _rows.iterator;
+  }
+}
+
+class ReqRespConnection {
   static const int HEADER_SIZE = 4;
   static const int COMPRESSED_HEADER_SIZE = 7;
   static const int STATE_PACKET_HEADER = 0;
   static const int STATE_PACKET_DATA = 1;
 
   Handler _handler;
-  Completer<dynamic> _completer;
+  Completer _completer;
+
 
   BufferedSocket _socket;
   var _largePacketBuffers = new List<Buffer>();
@@ -50,30 +213,15 @@ class SingleConnection {
   bool _useSSL = false;
   final int _maxPacketSize;
 
-//  int _dataSize;
-  bool _sentClose = false;
 
-  SingleConnection(this._socket, this._maxPacketSize, user, password, db, useCompression, useSSL, connectCompleter) :
+  ReqRespConnection(this._socket, this._maxPacketSize, user, password, db, useCompression, useSSL, Completer handshakeCompleter) :
         _headerBuffer = new Buffer(HEADER_SIZE),
         _compressedHeaderBuffer = new Buffer(COMPRESSED_HEADER_SIZE),
         _handler = new HandshakeHandler(
             user, password, _maxPacketSize, db, useCompression, useSSL),
-        _completer = connectCompleter;
+        _completer = handshakeCompleter;
 
-  Future close() async {
-    if (_sentClose) {
-      return;
-    }
-    _sentClose = true;
-
-    try {
-      await _processHandlerNoResponse(new QuitHandler());
-    } catch (e) {
-      _log.info("Error sending quit on connection");
-    }
-
-    _socket.close();
-  }
+  void close() => _socket.close();
 
   void socketError(e) {
     if (_completer != null) {
@@ -81,73 +229,6 @@ class SingleConnection {
     }
     close();
   }
-
-  /**
-   * Connects to the given [host] on [port], authenticates using [user]
-   * and [password] and connects to [db]. Returns a future which completes
-   * when this has happened. The future's value is an OkPacket if the connection
-   * is succesful.
-   */
-  static Future<SingleConnection> connect(
-      {String host,
-      int port,
-      String user,
-      String password,
-      String db,
-      bool useCompression: false,
-      bool useSSL: false,
-      int maxPacketSize: 16 * 1024 * 1024,
-      }) {
-
-    assert(!useSSL);  // Not implemented
-    assert(!useCompression);
-
-    SingleConnection sc;
-
-    var completer = new Completer();
-
-    _log.fine("opening connection to $host:$port/$db");
-    BufferedSocket.connect(host, port,
-        onConnection: (socket) {
-          sc = new SingleConnection(socket, maxPacketSize, user, password, db, useCompression, useSSL, completer);
-        },
-        onDataReady: () {
-          if (sc != null) {
-            sc._readPacket();
-          }
-        },
-        onDone: () {
-          sc.close();
-          _log.fine("done");
-        },
-        onError: (error) {
-          _log.fine("error $error");
-          // If the error happens during connect then propagate in the future.
-          // otherwise send to the socket.
-          if (!completer.isCompleted) {
-            completer.completeError(error);
-          } else {
-            sc.socketError(error);
-          }
-        },
-        onClosed: () {
-          sc.close();
-        });
-
-    //TODO Only useDatabase if connection actually ended up as an SSL connection?
-    //TODO On the other hand, it doesn't hurt to call useDatabase anyway.
-//    if (useSSL) {
-//      await _completer.future;
-//      return _useDatabase(db);
-//    } else {
-    return completer.future.then((_) => sc);
-//    }
-  }
-
-//  Future _useDatabase(String dbName) {
-//    var handler = new UseDbHandler(dbName);
-//    return _processHandler(handler);
-//  }
 
   Future _readPacket() async {
     _log.fine("readPacket readyForHeader=${_readyForHeader}");
@@ -286,21 +367,21 @@ class SingleConnection {
   }
 
   /// This method just sends the handler data.
-  Future _processHandlerNoResponse(Handler handler) async {
+  Future processHandlerNoResponse(Handler handler) {
     if (_handler != null) {
       throw createMySqlClientError(
           "Connection cannot process a request for $handler while a request is already in progress for $_handler");
     }
     _packetNumber = -1;
     _compressedPacketNumber = -1;
-    await _sendBuffer(handler.createRequest());
+    return _sendBuffer(handler.createRequest());
   }
 
   /**
    * Processes a handler, from sending the initial request to handling any packets returned from
    * mysql
    */
-  Future _processHandler(Handler handler) async {
+  Future processHandler(Handler handler) async {
     if (_handler != null) {
       throw createMySqlClientError(
           "Connection cannot process a request for $handler while a request is already in progress for $_handler");
@@ -312,54 +393,5 @@ class SingleConnection {
     _handler = handler;
     await _sendBuffer(handler.createRequest());
     return _completer.future;
-  }
-
-  Future<ReadResults> query(String sql, [List values]) async {
-    if (values == null || values.isEmpty) {
-      // Run the query without preparing it since we have no arguments.
-      var results = await _processHandler(new QueryStreamHandler(sql));
-      _log.fine("Got query results on for: ${sql}");
-      return await ReadResults.read(results);
-    }
-
-    var prepared;
-    var results;
-    try {
-      prepared = await _processHandler(new PrepareHandler(sql));
-      _log.fine("Prepared new query for: $sql");
-
-      var handler = new ExecuteQueryHandler(prepared, false /* executed */, values);
-      results = await _processHandler(handler);
-
-      _log.finest("Prepared query got results");
-
-      // Read all of the results. This is so we can close the handler before returning to the
-      // user. Obviously this is not super efficient but it guarantees correct api use.
-      return await ReadResults.read(results);
-
-    } finally {
-      if (prepared != null) {
-        await _processHandlerNoResponse(new CloseStatementHandler(prepared.statementHandlerId));
-      }
-    }
-  }
-}
-
-class ReadResults extends IterableBase<Row> {
-  final int insertId;
-  final int affectedRows;
-  final List<Field> fields;
-  final List<Row> _rows;
-
-  ReadResults(this._rows, this.fields, this.insertId, this.affectedRows);
-
-  static Future<ReadResults> read(Results r) async {
-    var rows = await r.toList();
-    return new ReadResults(rows, r.fields, r.insertId, r.affectedRows);
-  }
-
-  @override
-  Iterator<Row> get iterator {
-    return _rows.iterator;
   }
 }
